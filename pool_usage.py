@@ -128,8 +128,15 @@ def _search_auth_dir(roots: Iterable[Path], max_depth: int = 4, max_dirs: int = 
     return None
 
 
+def _pinned_auth_dir() -> Optional[str]:
+    """First line of ``auth-dir.txt`` beside this script — a per-host override that
+    survives ``git pull`` (the file is git-ignored)."""
+    lines = _read(Path(__file__).resolve().parent / "auth-dir.txt", 4096).strip().splitlines()
+    return lines[0].strip() if lines and lines[0].strip() else None
+
+
 def find_auth_dir(explicit: Optional[str] = None) -> Optional[Path]:
-    for raw in (explicit, os.environ.get("CLIPROXY_AUTH_DIR")):
+    for raw in (explicit, os.environ.get("CLIPROXY_AUTH_DIR"), _pinned_auth_dir()):
         if raw:
             return Path(raw).expanduser()
     for entry in _proxy_processes():

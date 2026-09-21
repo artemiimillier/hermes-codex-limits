@@ -13,10 +13,11 @@
  *   3. Fallback for (2) on a backend without the agent package: the core
  *      `session.usage` RPC (one account — the one the focused chat runs on).
  *
- * This half lives in the standalone `desktop-plugins/` root so it is on by
- * default (a package's `desktop/` half is opt-in). Plain ESM with `jsx()`
- * calls — loaded at runtime, so only Tailwind classes core already ships are
- * used; everything custom is an inline style.
+ * Ships as the package's `desktop/plugin.js`, so "Install from Git" in the app
+ * installs it together with the agent half; a hand-copied
+ * `~/.hermes/desktop-plugins/codex-limits/plugin.js` works the same way. Plain
+ * ESM with `jsx()` calls — loaded at runtime, so only Tailwind classes core
+ * already ships are used; everything custom is an inline style.
  */
 
 import { Button, cn, host, icons, Popover, PopoverContent, PopoverTrigger, Tip, useValue } from '@hermes/plugin-sdk'
@@ -40,10 +41,18 @@ const WINDOW_LABELS = {
 
 const KIND_LABELS = { codex: 'Codex · GPT', claude: 'Claude' }
 
-// Plain strings, not template literals: `${…}` here is SHELL syntax for the backend host.
-const PLUGIN_DIR = '"${HERMES_HOME:-/opt/data}/plugins/codex-limits"'
-const POOL_COMMAND = 'python3 ' + PLUGIN_DIR + '/pool_usage.py'
-const POOL_UPDATE_COMMAND = 'git -C ' + PLUGIN_DIR + ' pull --ff-only'
+// Shell run on the BACKEND host. Plain strings, not template literals: `$…`
+// here is shell syntax. The agent package lives in `<hermes home>/plugins/`;
+// try the backend's own HERMES_HOME, then the default home, then the Docker one.
+const HOMES = '"$HERMES_HOME" "$HOME/.hermes" /opt/data'
+const POOL_COMMAND =
+  'for d in ' + HOMES + '; do f="$d/plugins/codex-limits/pool_usage.py"; ' +
+  'if [ -f "$f" ]; then exec python3 "$f"; fi; done; ' +
+  'echo "pool_usage.py: No such file" >&2; exit 2'
+const POOL_UPDATE_COMMAND =
+  'for d in ' + HOMES + '; do p="$d/plugins/codex-limits"; ' +
+  'if [ -d "$p/.git" ]; then exec git -C "$p" pull --ff-only; fi; done; ' +
+  'echo "codex-limits: plugin folder with .git not found on the server" >&2; exit 2'
 
 // ---------------------------------------------------------------------------
 // One shared store for every mounted chip (split tiles mount several
