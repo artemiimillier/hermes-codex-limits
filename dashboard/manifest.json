@@ -1,0 +1,10 @@
+{
+  "name": "codex-limits",
+  "label": "Codex Limits",
+  "description": "Remaining Codex plan quota for every pooled account.",
+  "icon": "Gauge",
+  "version": "1.0.0",
+  "tab": { "path": "/codex-limits", "hidden": true },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

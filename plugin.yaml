@@ -1,0 +1,4 @@
+name: codex-limits
+version: 1.0.0
+description: "Shows remaining Codex (ChatGPT plan) rate-limit quota next to the composer's model picker — one row per pooled account."
+author: "Artemii Miller"
