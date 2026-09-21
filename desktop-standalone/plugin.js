@@ -1,15 +1,22 @@
 /**
- * Codex Limits — a chip before the composer's model pill showing how much of
- * the Codex (ChatGPT plan) quota is left; click for every window and every
- * pooled account. Data comes from this plugin's own backend route
- * (`/api/plugins/codex-limits/usage`, served by the agent package at
- * `~/.hermes/plugins/codex-limits/dashboard/plugin_api.py`), which reuses the
- * fetch behind `hermes usage --json`. This half lives in the standalone
- * `desktop-plugins/` root so it is on by default (a package's `desktop/` half
- * is opt-in).
+ * Codex Limits — a chip before the composer's model pill showing how much
+ * model quota is left; click for every account and every rate-limit window.
  *
- * Plain ESM with `jsx()` calls — loaded at runtime, so only Tailwind classes
- * core already ships are used; everything custom is an inline style.
+ * Three sources, all read-only, merged into one panel:
+ *   1. POOL — the accounts of a CLIProxyAPI pool on the backend host. Read by
+ *      running the agent package's `pool_usage.py` through the gateway's
+ *      `shell.exec` RPC (the app's own `!cmd`), so the script can be updated
+ *      with a `git pull` and no backend restart. Tokens never leave the host.
+ *   2. HERMES — the backend's own credential pool, from this plugin's REST
+ *      route (`/api/plugins/codex-limits/usage`, agent package
+ *      `~/.hermes/plugins/codex-limits/dashboard/plugin_api.py`).
+ *   3. Fallback for (2) on a backend without the agent package: the core
+ *      `session.usage` RPC (one account — the one the focused chat runs on).
+ *
+ * This half lives in the standalone `desktop-plugins/` root so it is on by
+ * default (a package's `desktop/` half is opt-in). Plain ESM with `jsx()`
+ * calls — loaded at runtime, so only Tailwind classes core already ships are
+ * used; everything custom is an inline style.
  */
 
 import { Button, cn, host, icons, Popover, PopoverContent, PopoverTrigger, Tip, useValue } from '@hermes/plugin-sdk'
@@ -22,7 +29,21 @@ const AFTER_TURN_DELAY_MS = 4_000
 const LOW_REMAINING = 25
 const CRITICAL_REMAINING = 10
 
-const WINDOW_LABELS = { Session: '5 часов', Weekly: 'Неделя' }
+const WINDOW_LABELS = {
+  Session: '5 часов',
+  Weekly: 'Неделя',
+  'Current session': '5 часов',
+  'Current week': 'Неделя',
+  'Opus week': 'Opus, неделя',
+  'Sonnet week': 'Sonnet, неделя'
+}
+
+const KIND_LABELS = { codex: 'Codex · GPT', claude: 'Claude' }
+
+// Plain strings, not template literals: `${…}` here is SHELL syntax for the backend host.
+const PLUGIN_DIR = '"${HERMES_HOME:-/opt/data}/plugins/codex-limits"'
+const POOL_COMMAND = 'python3 ' + PLUGIN_DIR + '/pool_usage.py'
+const POOL_UPDATE_COMMAND = 'git -C ' + PLUGIN_DIR + ' pull --ff-only'
 
 // ---------------------------------------------------------------------------
 // One shared store for every mounted chip (split tiles mount several
@@ -37,6 +58,8 @@ let inflight = null
 // the core `session.usage` RPC instead (retried on a manual refresh).
 let restMissing = false
 let sessionId = null
+// The pool script asks every account's provider — reuse a fresh answer.
+let poolCache = { at: 0, value: null }
 
 const NO_SESSION = 'no-session'
 let mounted = 0
@@ -53,6 +76,77 @@ function subscribe(listener) {
 
   return () => listeners.delete(listener)
 }
+
+// ── source 1: the CLIProxyAPI pool, via shell.exec ─────────────────────────
+
+/** `pool_usage.py` row → the account shape the panel renders. */
+function poolAccount(row) {
+  const windows = (row.w ?? []).map(([label, used, reset]) => ({
+    label,
+    used_percent: typeof used === 'number' ? used : null,
+    resets_at: typeof reset === 'number' ? new Date(reset * 1000).toISOString() : null
+  }))
+
+  return {
+    index: row.i,
+    id: `pool-${row.t}-${row.i}`,
+    kind: row.t,
+    label: row.l,
+    plan: row.p ?? null,
+    disabled: Boolean(row.off),
+    available: !row.off && !row.e && windows.length > 0,
+    unavailable_reason: row.off ? 'отключён в прокси' : row.e || (windows.length ? null : 'нет данных о лимитах'),
+    windows,
+    details: row.d ?? []
+  }
+}
+
+async function fetchPool(force) {
+  if (!force && poolCache.value && Date.now() - poolCache.at < STALE_MS) {
+    return poolCache.value
+  }
+
+  const result = await host.request('shell.exec', { command: POOL_COMMAND }, 40_000)
+  const line = String(result?.stdout ?? '').trim().split('\n').pop() ?? ''
+  let value
+
+  if (line.startsWith('{')) {
+    const parsed = JSON.parse(line)
+
+    value = {
+      ok: Boolean(parsed.ok),
+      total: parsed.n ?? parsed.accounts?.length ?? 0,
+      error: parsed.error ?? null,
+      accounts: (parsed.accounts ?? []).map(poolAccount)
+    }
+  } else {
+    const stderr = String(result?.stderr ?? '').trim()
+
+    // No script on the host yet: the agent package predates it (or is absent).
+    value = /no such file|can't open file/i.test(stderr)
+      ? { ok: false, missing: true, total: 0, error: null, accounts: [] }
+      : { ok: false, total: 0, error: stderr.slice(-160) || `pool_usage.py завершился с кодом ${result?.code}`, accounts: [] }
+  }
+
+  poolCache = { at: Date.now(), value }
+
+  return value
+}
+
+/** Pull the agent package on the backend host so `pool_usage.py` appears. User-initiated only. */
+async function updateBackendPackage() {
+  const result = await host.request('shell.exec', { command: POOL_UPDATE_COMMAND }, 40_000)
+
+  if (result?.code !== 0) {
+    throw new Error(String(result?.stderr || result?.stdout || 'git pull не удался').trim().slice(-200))
+  }
+
+  poolCache = { at: 0, value: null }
+
+  return refresh(true)
+}
+
+// ── sources 2 + 3: the backend's own account(s) ────────────────────────────
 
 // `session.usage` renders the account block as text (the `/usage` lines):
 //   Provider: openai-codex (Prolite)
@@ -152,7 +246,7 @@ async function fetchViaGateway() {
   return { provider: account.provider, fetched_at: Date.now() / 1000, accounts: [account], source: 'gateway' }
 }
 
-async function fetchLimits(force) {
+async function fetchHermes(force) {
   if (restMissing && !force) {
     return fetchViaGateway()
   }
@@ -172,6 +266,22 @@ async function fetchLimits(force) {
 
     return fetchViaGateway()
   }
+}
+
+// ── merge ──────────────────────────────────────────────────────────────────
+
+/** Both halves are optional; only a total blank is an error. */
+async function fetchLimits(force) {
+  const [pool, hermes] = await Promise.allSettled([fetchPool(force), fetchHermes(force)])
+  const poolValue = pool.status === 'fulfilled' ? pool.value : { ok: false, total: 0, accounts: [], error: String(pool.reason?.message || pool.reason) }
+
+  if (hermes.status === 'rejected' && !poolValue.accounts.length) {
+    throw hermes.reason
+  }
+
+  const hermesValue = hermes.status === 'fulfilled' ? hermes.value : { provider: null, accounts: [] }
+
+  return { ...hermesValue, pool: poolValue }
 }
 
 function refresh(force = false) {
@@ -297,6 +407,37 @@ function activeAccount(accounts) {
   return usable.find(account => account.pool_status !== 'exhausted') ?? usable[0] ?? null
 }
 
+/** Which pool accounts serve this model: GPT-family → codex logins, Claude-family → claude logins. */
+function familyOf(model) {
+  const slug = String(model ?? '').toLowerCase()
+
+  if (/claude|opus|sonnet|haiku|fable/.test(slug)) {
+    return 'claude'
+  }
+
+  return /gpt|codex|\bo\d/.test(slug) ? 'codex' : null
+}
+
+/** Pool gauge for the chip: the mean of every readable account's tightest
+ *  window (a proxy rotates across accounts, so no single one is "current"). */
+function poolSummary(accounts, model) {
+  const family = familyOf(model)
+  const scoped = accounts.filter(account => account.kind === family)
+  const group = scoped.length ? scoped : accounts
+  const readable = group.map(tightest).filter(value => value !== null)
+
+  if (!readable.length) {
+    return { remaining: null, alive: 0, total: group.length, family: scoped.length ? family : null }
+  }
+
+  return {
+    remaining: Math.round(readable.reduce((sum, value) => sum + value, 0) / readable.length),
+    alive: readable.filter(value => value > 0).length,
+    total: group.length,
+    family: scoped.length ? family : null
+  }
+}
+
 function toneColor(remaining) {
   if (remaining === null) {
     return 'var(--ui-text-quaternary)'
@@ -313,7 +454,7 @@ function toneColor(remaining) {
   return 'var(--ui-green, #46a758)'
 }
 
-function formatCountdown(iso) {
+function formatCountdown(iso, { short = false } = {}) {
   const ms = new Date(iso).getTime() - Date.now()
 
   if (!Number.isFinite(ms)) {
@@ -321,7 +462,7 @@ function formatCountdown(iso) {
   }
 
   if (ms <= 0) {
-    return 'сброс вот-вот'
+    return short ? 'вот-вот' : 'сброс вот-вот'
   }
 
   const minutes = Math.round(ms / 60_000)
@@ -329,7 +470,7 @@ function formatCountdown(iso) {
   const hours = Math.floor((minutes % 1440) / 60)
   const parts = days ? [`${days} д`, `${hours} ч`] : hours ? [`${hours} ч`, `${minutes % 60} мин`] : [`${minutes} мин`]
 
-  return `сброс через ${parts.join(' ')}`
+  return short ? parts.join(' ') : `сброс через ${parts.join(' ')}`
 }
 
 const formatMoment = iso =>
@@ -340,6 +481,9 @@ const formatClock = ms => new Date(ms).toLocaleTimeString('ru-RU', { hour: '2-di
 // ---------------------------------------------------------------------------
 // View
 // ---------------------------------------------------------------------------
+
+const MUTED = { color: 'var(--ui-text-tertiary)', fontSize: '0.6875rem' }
+const SPREAD = { alignItems: 'baseline', display: 'flex', gap: 12, justifyContent: 'space-between' }
 
 /** Depleting ring: the arc IS the remaining share. */
 function Ring({ remaining, size = 14 }) {
@@ -378,6 +522,21 @@ function Ring({ remaining, size = 14 }) {
   })
 }
 
+function Bar({ remaining }) {
+  return jsx('div', {
+    style: { background: 'var(--chrome-action-hover)', borderRadius: 999, height: 4, overflow: 'hidden' },
+    children: jsx('div', {
+      style: {
+        background: toneColor(remaining),
+        borderRadius: 999,
+        height: '100%',
+        transition: 'width 300ms ease',
+        width: `${remaining ?? 0}%`
+      }
+    })
+  })
+}
+
 function WindowRow({ window }) {
   const remaining = remainingOf(window)
   const label = WINDOW_LABELS[window.label] ?? window.label
@@ -386,7 +545,7 @@ function WindowRow({ window }) {
     style: { display: 'grid', gap: 4 },
     children: [
       jsxs('div', {
-        style: { alignItems: 'baseline', display: 'flex', justifyContent: 'space-between', gap: 12 },
+        style: SPREAD,
         children: [
           jsx('span', { style: { color: 'var(--ui-text-secondary)' }, children: label }),
           jsx('span', {
@@ -395,27 +554,117 @@ function WindowRow({ window }) {
           })
         ]
       }),
-      jsx('div', {
-        style: { background: 'var(--chrome-action-hover)', borderRadius: 999, height: 4, overflow: 'hidden' },
-        children: jsx('div', {
-          style: {
-            background: toneColor(remaining),
-            borderRadius: 999,
-            height: '100%',
-            transition: 'width 300ms ease',
-            width: `${remaining ?? 0}%`
-          }
-        })
-      }),
+      jsx(Bar, { remaining }),
       window.resets_at
-        ? jsx('div', {
-            style: { color: 'var(--ui-text-tertiary)', fontSize: '0.6875rem' },
-            children: `${formatCountdown(window.resets_at)} · ${formatMoment(window.resets_at)}`
-          })
+        ? jsx('div', { style: MUTED, children: `${formatCountdown(window.resets_at)} · ${formatMoment(window.resets_at)}` })
         : window.detail
-          ? jsx('div', { style: { color: 'var(--ui-text-tertiary)', fontSize: '0.6875rem' }, children: window.detail })
+          ? jsx('div', { style: MUTED, children: window.detail })
           : null
     ]
+  })
+}
+
+/** One line per window — a pool lists many accounts, so rows stay dense. */
+function CompactWindowRow({ window }) {
+  const remaining = remainingOf(window)
+
+  return jsxs('div', {
+    style: { alignItems: 'center', display: 'grid', gap: 8, gridTemplateColumns: '84px 1fr 38px 78px' },
+    children: [
+      jsx('span', { style: { ...MUTED, color: 'var(--ui-text-secondary)' }, children: WINDOW_LABELS[window.label] ?? window.label }),
+      jsx(Bar, { remaining }),
+      jsx('span', {
+        style: { color: toneColor(remaining), fontVariantNumeric: 'tabular-nums', fontWeight: 600, textAlign: 'right' },
+        children: remaining === null ? '—' : `${remaining}%`
+      }),
+      jsx('span', {
+        style: { ...MUTED, textAlign: 'right' },
+        title: window.resets_at ? `сброс ${formatMoment(window.resets_at)}` : undefined,
+        children: window.resets_at ? formatCountdown(window.resets_at, { short: true }) : ''
+      })
+    ]
+  })
+}
+
+function PoolAccountRow({ account }) {
+  return jsxs('div', {
+    style: { display: 'grid', gap: 4, opacity: account.disabled ? 0.55 : 1 },
+    children: [
+      jsxs('div', {
+        style: SPREAD,
+        children: [
+          jsx('span', {
+            style: { fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+            children: account.label
+          }),
+          account.plan ? jsx('span', { style: MUTED, children: account.plan }) : null
+        ]
+      }),
+      ...account.windows.map(window => jsx(CompactWindowRow, { window }, window.label)),
+      account.unavailable_reason ? jsx('div', { style: MUTED, children: account.unavailable_reason }) : null,
+      ...account.details.map(line => jsx('div', { style: MUTED, children: line }, line))
+    ]
+  })
+}
+
+function PoolSection({ pool, model, onUpdate, updating, updateError }) {
+  if (pool.missing) {
+    return jsxs('div', {
+      style: { display: 'grid', gap: 6 },
+      children: [
+        jsx('div', {
+          style: MUTED,
+          children: 'Пул CLIProxyAPI: на сервере нет скрипта pool_usage.py — серверная часть плагина старая.'
+        }),
+        jsx(Button, {
+          className: 'h-6 justify-self-start px-2 text-xs font-normal',
+          disabled: updating,
+          onClick: onUpdate,
+          type: 'button',
+          variant: 'outline',
+          children: updating ? 'Обновляю…' : 'Обновить плагин на сервере (git pull)'
+        }),
+        updateError ? jsx('div', { style: { ...MUTED, color: 'var(--ui-red, #e5484d)' }, children: updateError }) : null
+      ]
+    })
+  }
+
+  if (!pool.accounts.length) {
+    return pool.error ? jsx('div', { style: MUTED, children: `Пул CLIProxyAPI: ${pool.error}` }) : null
+  }
+
+  const family = familyOf(model)
+  const kinds = [...new Set(pool.accounts.map(account => account.kind))].sort(
+    (a, b) => Number(b === family) - Number(a === family)
+  )
+
+  return jsxs('div', {
+    style: { display: 'grid', gap: 12 },
+    children: kinds.map(kind => {
+      const accounts = pool.accounts.filter(account => account.kind === kind)
+      const summary = poolSummary(accounts, null)
+
+      return jsxs(
+        'div',
+        {
+          style: { display: 'grid', gap: 10 },
+          children: [
+            jsxs('div', {
+              style: { ...SPREAD, borderBottom: '1px solid var(--chrome-action-hover)', paddingBottom: 4 },
+              children: [
+                jsx('span', { style: { fontWeight: 600 }, children: `${KIND_LABELS[kind] ?? kind} · ${accounts.length}` }),
+                jsx('span', {
+                  style: { ...MUTED, color: toneColor(summary.remaining) },
+                  children: summary.remaining === null ? 'нет данных' : `в среднем ${summary.remaining}% · живых ${summary.alive}`
+                })
+              ]
+            }),
+            ...accounts.map(account => jsx(PoolAccountRow, { account }, account.id))
+          ]
+        },
+        kind
+      )
+    })
   })
 }
 
@@ -427,14 +676,14 @@ function AccountBlock({ account, showIdentity }) {
     children: [
       showIdentity
         ? jsxs('div', {
-            style: { alignItems: 'baseline', display: 'flex', justifyContent: 'space-between', gap: 12 },
+            style: SPREAD,
             children: [
               jsx('span', {
                 style: { fontWeight: 600 },
                 children: `#${account.index} ${account.label || account.id || 'аккаунт'}`
               }),
               jsx('span', {
-                style: { color: exhausted ? 'var(--ui-red, #e5484d)' : 'var(--ui-text-tertiary)', fontSize: '0.6875rem' },
+                style: { ...MUTED, color: exhausted ? 'var(--ui-red, #e5484d)' : MUTED.color },
                 children: [account.plan, exhausted ? 'исчерпан' : null].filter(Boolean).join(' · ')
               })
             ]
@@ -446,47 +695,71 @@ function AccountBlock({ account, showIdentity }) {
             style: { color: 'var(--ui-text-tertiary)' },
             children: account.unavailable_reason || 'Лимиты недоступны'
           }),
-      ...(account.details ?? []).map(line =>
-        jsx('div', { style: { color: 'var(--ui-text-tertiary)', fontSize: '0.6875rem' }, children: line }, line)
-      )
+      ...(account.details ?? []).map(line => jsx('div', { style: MUTED, children: line }, line))
     ]
   })
 }
 
-function LimitsPanel({ state }) {
+function LimitsPanel({ state, model }) {
+  const [updating, setUpdating] = useState(false)
+  const [updateError, setUpdateError] = useState(null)
   const accounts = state.data?.accounts ?? []
+  const pool = state.data?.pool ?? { accounts: [] }
+  const hasPool = pool.accounts.length > 0
   const pooled = accounts.length > 1
-  const plan = !pooled ? accounts[0]?.plan : null
   const working = state.status === 'loading' || state.status === 'refreshing'
   const provider = state.data?.provider
-  const title = !provider || provider === 'openai-codex' ? 'Лимиты Codex' : `Лимиты · ${provider}`
+  const ownTitle = !provider || provider === 'openai-codex' ? 'Codex' : provider
+  const title = hasPool ? `Лимиты пула · ${pool.total ?? pool.accounts.length} акк.` : `Лимиты ${ownTitle}`
+  const nothing = !accounts.length && !hasPool
+
+  const onUpdate = () => {
+    setUpdating(true)
+    setUpdateError(null)
+    updateBackendPackage()
+      .catch(error => setUpdateError(String(error?.message || error)))
+      .finally(() => setUpdating(false))
+  }
 
   return jsxs('div', {
-    style: { display: 'grid', fontSize: '0.75rem', gap: 12, minWidth: 248 },
+    style: { display: 'grid', fontSize: '0.75rem', gap: 12, maxHeight: '62vh', minWidth: 300, overflowY: 'auto', paddingRight: 2 },
     children: [
       jsxs('div', {
-        style: { alignItems: 'baseline', display: 'flex', justifyContent: 'space-between', gap: 12 },
+        style: SPREAD,
         children: [
-          jsx('span', { style: { fontWeight: 600 }, children: pooled ? `${title} · пул (${accounts.length})` : title }),
-          plan ? jsx('span', { style: { color: 'var(--ui-text-tertiary)' }, children: plan }) : null
+          jsx('span', { style: { fontWeight: 600 }, children: title }),
+          !hasPool && !pooled && accounts[0]?.plan ? jsx('span', { style: MUTED, children: accounts[0].plan }) : null
         ]
       }),
-      state.status === 'error' && !accounts.length
+      state.status === 'error' && nothing
         ? jsx('div', { style: { color: 'var(--ui-red, #e5484d)' }, children: `Не удалось получить лимиты: ${state.error}` })
         : null,
-      state.status === NO_SESSION && !accounts.length
-        ? jsx('div', {
-            style: { color: 'var(--ui-text-tertiary)' },
-            children: 'Откройте любой чат — лимиты берутся из его сессии.'
-          })
+      state.status === NO_SESSION && nothing
+        ? jsx('div', { style: { color: 'var(--ui-text-tertiary)' }, children: 'Откройте любой чат — лимиты берутся из его сессии.' })
         : null,
-      !accounts.length && (state.status === 'idle' || working)
+      nothing && (state.status === 'idle' || working)
         ? jsx('div', { style: { color: 'var(--ui-text-tertiary)' }, children: 'Загружаю…' })
         : null,
-      ...accounts.map(account => jsx(AccountBlock, { account, showIdentity: pooled }, account.id ?? account.index)),
-      state.data?.source === 'gateway'
+      jsx(PoolSection, { model, onUpdate, pool, updateError, updating }),
+      accounts.length
+        ? jsxs('div', {
+            style: { display: 'grid', gap: 10 },
+            children: [
+              hasPool
+                ? jsx('div', {
+                    style: { ...SPREAD, borderBottom: '1px solid var(--chrome-action-hover)', fontWeight: 600, paddingBottom: 4 },
+                    children: `Hermes · свой аккаунт ${ownTitle}`
+                  })
+                : null,
+              ...accounts.map(account =>
+                jsx(AccountBlock, { account, showIdentity: pooled || hasPool }, account.id ?? account.index)
+              )
+            ]
+          })
+        : null,
+      state.data?.source === 'gateway' && !hasPool
         ? jsx('div', {
-            style: { color: 'var(--ui-text-quaternary)', fontSize: '0.6875rem' },
+            style: { ...MUTED, color: 'var(--ui-text-quaternary)' },
             children: 'Аккаунт, на котором работает этот чат (данные сервера).'
           })
         : null,
@@ -520,29 +793,33 @@ function LimitsChip() {
   useSessionBinding()
 
   const state = useLimits()
+  const model = useValue(host.state.model)
   const [open, setOpen] = useState(false)
 
   useRefreshAfterTurn()
 
   const accounts = state.data?.accounts ?? []
+  const poolAccounts = state.data?.pool?.accounts ?? []
+  const summary = poolAccounts.length ? poolSummary(poolAccounts, model) : null
   const account = activeAccount(accounts)
-  const remaining = tightest(account)
+  const remaining = summary ? summary.remaining : tightest(account)
 
-  // Nothing to show for this setup (no Codex credential) — stay out of the row.
-  if (state.status === 'ready' && !account) {
+  // Nothing to show for this setup (no credential anywhere) — stay out of the row.
+  if (state.status === 'ready' && !account && !poolAccounts.length) {
     return null
   }
 
   const settled = state.status === 'error' || state.status === NO_SESSION
-  const label = remaining === null ? (settled ? '—' : '…') : `${remaining}%`
+  const label = remaining === null ? (settled || summary ? '—' : '…') : `${remaining}%`
   const provider = state.data?.provider
   const subject = !provider || provider === 'openai-codex' ? 'Codex' : provider
 
   const problem =
     state.status === 'error' ? state.error : state.status === NO_SESSION ? 'откройте чат, чтобы подтянуть данные' : null
 
-  const tip =
-    remaining === null
+  const tip = summary
+    ? `Пул${summary.family ? ` ${KIND_LABELS[summary.family]}` : ''}: в среднем осталось ${summary.remaining ?? '—'}% · живых аккаунтов ${summary.alive} из ${summary.total}`
+    : remaining === null
       ? `Лимиты ${subject}${problem ? `: ${problem}` : ''}`
       : `Лимит ${subject}: осталось ${remaining}%${accounts.length > 1 ? ` · аккаунт #${account.index} из ${accounts.length}` : ''}`
 
@@ -586,7 +863,7 @@ function LimitsChip() {
         side: 'top',
         sideOffset: 8,
         style: { padding: 12, width: 'auto' },
-        children: jsx(LimitsPanel, { state })
+        children: jsx(LimitsPanel, { model, state })
       })
     ]
   })
