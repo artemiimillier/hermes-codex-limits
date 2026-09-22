@@ -2,16 +2,18 @@
  * Codex Limits — a chip before the composer's model pill showing how much
  * model quota is left; click for every account and every rate-limit window.
  *
- * Three sources, all read-only, merged into one panel:
- *   1. POOL — the accounts of a CLIProxyAPI pool on the backend host. Read by
+ * Everything is read from the Hermes server the FOCUSED CHAT belongs to (the
+ * app can hold several servers at once): requests go to that server, results
+ * are cached per (server, profile), and switching servers switches the data.
+ *
+ * Sources on that server, all read-only, merged into one panel:
+ *   1. POOL — the accounts of a CLIProxyAPI pool on the server host. Read by
  *      running the agent package's `pool_usage.py` through the gateway's
  *      `shell.exec` RPC (the app's own `!cmd`), so the script can be updated
- *      with a `git pull` and no backend restart. Tokens never leave the host.
- *   2. HERMES — the backend's own credential pool, from this plugin's REST
- *      route (`/api/plugins/codex-limits/usage`, agent package
- *      `~/.hermes/plugins/codex-limits/dashboard/plugin_api.py`).
- *   3. Fallback for (2) on a backend without the agent package: the core
- *      `session.usage` RPC (one account — the one the focused chat runs on).
+ *      with a `git fetch` and no backend restart. Tokens never leave the host.
+ *   2. HERMES — the server's own credential pool, from this plugin's REST
+ *      route (`/api/plugins/codex-limits/usage`) when the server is the
+ *      active connection, else from the core `session.usage` RPC.
  *
  * Ships as the package's `desktop/plugin.js`, so "Install from Git" in the app
  * installs it together with the agent half; a hand-copied
@@ -27,8 +29,10 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const STALE_MS = 60_000
 const POLL_MS = 5 * 60_000
 const AFTER_TURN_DELAY_MS = 4_000
+const ROUTES_TTL_MS = 60_000
 const LOW_REMAINING = 25
 const CRITICAL_REMAINING = 10
+const REPO_URL = 'https://github.com/artemiimillier/hermes-codex-limits'
 
 const WINDOW_LABELS = {
   Session: '5 часов',
@@ -41,49 +45,153 @@ const WINDOW_LABELS = {
 
 const KIND_LABELS = { codex: 'Codex · GPT', claude: 'Claude' }
 
-// Shell run on the BACKEND host. Plain strings, not template literals: `$…`
+// Shell run on the SERVER host. Plain strings, not template literals: `$…`
 // here is shell syntax. The agent package lives in `<hermes home>/plugins/`;
-// try the backend's own HERMES_HOME, then the default home, then the Docker one.
+// try the server's own HERMES_HOME, then the default home, then the Docker one.
 const HOMES = '"$HERMES_HOME" "$HOME/.hermes" /opt/data'
+const EXIT_OLD_VERSION = 2
+const EXIT_NOT_INSTALLED = 3
 const POOL_COMMAND =
-  'for d in ' + HOMES + '; do f="$d/plugins/codex-limits/pool_usage.py"; ' +
-  'if [ -f "$f" ]; then exec python3 "$f"; fi; done; ' +
-  'echo "pool_usage.py: No such file" >&2; exit 2'
-const POOL_UPDATE_COMMAND =
+  'o=; for d in ' + HOMES + '; do p="$d/plugins/codex-limits"; ' +
+  'if [ -f "$p/pool_usage.py" ]; then exec python3 "$p/pool_usage.py"; fi; ' +
+  'if [ -d "$p" ]; then o=1; fi; done; ' +
+  'if [ -n "$o" ]; then echo "codex-limits: pool_usage.py: No such file (old version)" >&2; exit ' + EXIT_OLD_VERSION + '; fi; ' +
+  'echo "codex-limits: not installed on this server" >&2; exit ' + EXIT_NOT_INSTALLED
+// fetch + reset, not pull: the repo's history may be rewritten upstream, and a
+// plugin folder holds no local edits (a git-ignored auth-dir.txt survives).
+const UPDATE_COMMAND =
   'for d in ' + HOMES + '; do p="$d/plugins/codex-limits"; ' +
-  'if [ -d "$p/.git" ]; then exec git -C "$p" pull --ff-only; fi; done; ' +
-  'echo "codex-limits: plugin folder with .git not found on the server" >&2; exit 2'
+  'if [ -d "$p/.git" ]; then cd "$p" && git fetch -q --depth 1 origin HEAD && git reset -q --hard FETCH_HEAD && git log -1 --format=%h; exit $?; fi; done; ' +
+  'echo "codex-limits: plugin folder with .git not found on this server" >&2; exit 2'
 
 // ---------------------------------------------------------------------------
-// One shared store for every mounted chip (split tiles mount several
-// composers): a single in-flight fetch and a single poll timer.
+// Which server: the focused chat's owner (connection + profile), else the
+// active gateway. `isActive` → the live socket and `ctx.rest` reach it.
+// ---------------------------------------------------------------------------
+
+const ACTIVE = 'active'
+
+const normProfile = profile => String(profile || 'default').trim().toLowerCase() || 'default'
+
+function targetFrom(owner, activeConnectionId, activeProfile) {
+  const active = activeConnectionId || null
+  const connectionId = owner?.connectionId || active || ACTIVE
+  const profile = normProfile(owner?.profile || activeProfile)
+  const sameConnection = !owner?.connectionId || !active || owner.connectionId === active
+  const isActive = sameConnection && profile === normProfile(activeProfile)
+
+  return { connectionId, profile, isActive, key: `${connectionId}::${profile}` }
+}
+
+const labels = new Map()
+let labelsLoading = null
+
+function loadLabels() {
+  labelsLoading ??= Promise.resolve()
+    .then(() => host.connections?.())
+    .then(rows => {
+      for (const row of rows ?? []) {
+        labels.set(row.id, row.label || row.id)
+      }
+    })
+    .catch(() => undefined)
+    .finally(() => {
+      labelsLoading = null
+      notify()
+    })
+
+  return labelsLoading
+}
+
+function serverLabel(connectionId) {
+  if (connectionId === 'local') {
+    return 'этот компьютер'
+  }
+
+  return labels.get(connectionId) ?? (connectionId === ACTIVE ? 'текущий сервер' : connectionId)
+}
+
+let routesCache = { at: 0, value: null }
+
+async function routeFor(target) {
+  if (typeof host.profileRoutes !== 'function' || typeof host.requestProfile !== 'function') {
+    return null
+  }
+
+  if (!routesCache.value || Date.now() - routesCache.at > ROUTES_TTL_MS) {
+    routesCache = { at: Date.now(), value: await host.profileRoutes() }
+  }
+
+  const routes = (routesCache.value ?? []).filter(route => route.connectionId === target.connectionId)
+
+  return (
+    routes.find(route => normProfile(route.targetProfile) === target.profile || normProfile(route.profile) === target.profile) ??
+    routes[0] ??
+    null
+  )
+}
+
+/** Gateway RPC to the target server: the live socket when it is the active
+ *  one, else a routed (pooled) socket to that connection. */
+async function rpc(target, method, params, timeoutMs) {
+  if (target.isActive) {
+    return host.request(method, params, timeoutMs)
+  }
+
+  const route = await routeFor(target)
+
+  if (!route) {
+    throw new Error(`нет связи с сервером «${serverLabel(target.connectionId)}»`)
+  }
+
+  return host.requestProfile(route, method, params, timeoutMs)
+}
+
+// ---------------------------------------------------------------------------
+// One slot per (server, profile) and one shared current target for every
+// mounted chip (split tiles mount several composers).
 // ---------------------------------------------------------------------------
 
 let rest = null
-let snapshot = { status: 'idle', data: null, error: null, at: 0 }
-let inflight = null
-// The plugin route only exists on a backend that has the agent package
-// installed. A remote backend without it answers 404 — remember that and read
-// the core `session.usage` RPC instead (retried on a manual refresh).
-let restMissing = false
+let current = null
 let sessionId = null
-// The pool script asks every account's provider — reuse a fresh answer.
-let poolCache = { at: 0, value: null }
-
-const NO_SESSION = 'no-session'
 let mounted = 0
 let pollTimer = null
 const listeners = new Set()
+const slots = new Map()
+const EMPTY = { status: 'idle', data: null, error: null, at: 0 }
+const NO_SESSION = 'no-session'
 
-function publish(next) {
-  snapshot = { ...snapshot, ...next }
+function slotOf(key) {
+  let slot = slots.get(key)
+
+  if (!slot) {
+    slot = { snapshot: EMPTY, pool: { at: 0, value: null }, restMissing: false, inflight: null }
+    slots.set(key, slot)
+  }
+
+  return slot
+}
+
+function notify() {
   listeners.forEach(listener => listener())
+}
+
+function publish(key, next) {
+  const slot = slotOf(key)
+
+  slot.snapshot = { ...slot.snapshot, ...next }
+  notify()
 }
 
 function subscribe(listener) {
   listeners.add(listener)
 
   return () => listeners.delete(listener)
+}
+
+function readSnapshot() {
+  return current ? slotOf(current.key).snapshot : EMPTY
 }
 
 // ── source 1: the CLIProxyAPI pool, via shell.exec ─────────────────────────
@@ -110,52 +218,66 @@ function poolAccount(row) {
   }
 }
 
-async function fetchPool(force) {
-  if (!force && poolCache.value && Date.now() - poolCache.at < STALE_MS) {
-    return poolCache.value
-  }
-
-  const result = await host.request('shell.exec', { command: POOL_COMMAND }, 40_000)
+/** `shell.exec` result of POOL_COMMAND → pool state. */
+function parsePoolResult(result) {
   const line = String(result?.stdout ?? '').trim().split('\n').pop() ?? ''
-  let value
+  const stderr = String(result?.stderr ?? '').trim()
 
   if (line.startsWith('{')) {
     const parsed = JSON.parse(line)
 
-    value = {
+    return {
       ok: Boolean(parsed.ok),
       total: parsed.n ?? parsed.accounts?.length ?? 0,
       error: parsed.error ?? null,
       accounts: (parsed.accounts ?? []).map(poolAccount)
     }
-  } else {
-    const stderr = String(result?.stderr ?? '').trim()
-
-    // No script on the host yet: the agent package predates it (or is absent).
-    value = /no such file|can't open file/i.test(stderr)
-      ? { ok: false, missing: true, total: 0, error: null, accounts: [] }
-      : { ok: false, total: 0, error: stderr.slice(-160) || `pool_usage.py завершился с кодом ${result?.code}`, accounts: [] }
   }
 
-  poolCache = { at: Date.now(), value }
+  if (result?.code === EXIT_NOT_INSTALLED || /not installed on this server/i.test(stderr)) {
+    return { ok: false, notInstalled: true, total: 0, error: null, accounts: [] }
+  }
+
+  if (result?.code === EXIT_OLD_VERSION || /no such file|can't open file/i.test(stderr)) {
+    return { ok: false, missing: true, total: 0, error: null, accounts: [] }
+  }
+
+  return { ok: false, total: 0, error: stderr.slice(-160) || `pool_usage.py завершился с кодом ${result?.code}`, accounts: [] }
+}
+
+async function fetchPool(target, slot, force) {
+  if (!force && slot.pool.value && Date.now() - slot.pool.at < STALE_MS) {
+    return slot.pool.value
+  }
+
+  const value = parsePoolResult(await rpc(target, 'shell.exec', { command: POOL_COMMAND }, 40_000))
+
+  slot.pool = { at: Date.now(), value }
 
   return value
 }
 
-/** Pull the agent package on the backend host so `pool_usage.py` appears. User-initiated only. */
-async function updateBackendPackage() {
-  const result = await host.request('shell.exec', { command: POOL_UPDATE_COMMAND }, 40_000)
+/** Refresh the agent package on the target server so the newest `pool_usage.py` runs. User-initiated only. */
+async function updateServerPlugin() {
+  const target = current
 
-  if (result?.code !== 0) {
-    throw new Error(String(result?.stderr || result?.stdout || 'git pull не удался').trim().slice(-200))
+  if (!target) {
+    return null
   }
 
-  poolCache = { at: 0, value: null }
+  const result = await rpc(target, 'shell.exec', { command: UPDATE_COMMAND }, 40_000)
 
-  return refresh(true)
+  if (result?.code !== 0) {
+    throw new Error(String(result?.stderr || result?.stdout || 'обновление не удалось').trim().slice(-200))
+  }
+
+  slotOf(target.key).pool = { at: 0, value: null }
+  await refresh(true)
+
+  return String(result?.stdout ?? '').trim()
 }
 
-// ── sources 2 + 3: the backend's own account(s) ────────────────────────────
+// ── source 2: the server's own account(s) ──────────────────────────────────
 
 // `session.usage` renders the account block as text (the `/usage` lines):
 //   Provider: openai-codex (Prolite)
@@ -235,110 +357,137 @@ function parseAccountLines(lines) {
   return account
 }
 
-async function fetchViaGateway() {
+async function fetchViaGateway(target) {
   if (!sessionId) {
-    throw new Error(NO_SESSION)
+    return { provider: null, accounts: [], note: NO_SESSION }
   }
 
-  const usage = await host.request('session.usage', { session_id: sessionId }, 45_000)
+  const usage = await rpc(target, 'session.usage', { session_id: sessionId }, 45_000)
   const account = parseAccountLines(usage?.account_lines)
 
   if (!account) {
-    // `account_lines` shipped in hermes-agent 604d8803a1 (2026-09-19); an older
-    // backend answers without it. It is also omitted when the backend's own
-    // usage fetch fails (fail-open), so word this as the likely cause only.
-    throw new Error(
-      'сервер Hermes не прислал лимиты. Скорее всего, он старее 19.09.2026 — обновите Hermes на сервере (hermes update)'
-    )
+    return { provider: null, accounts: [], note: 'сервер не прислал лимиты своих аккаунтов' }
   }
 
-  return { provider: account.provider, fetched_at: Date.now() / 1000, accounts: [account], source: 'gateway' }
+  return { provider: account.provider, accounts: [account], source: 'gateway' }
 }
 
-async function fetchHermes(force) {
-  if (restMissing && !force) {
-    return fetchViaGateway()
-  }
+async function fetchHermes(target, slot, force) {
+  // `ctx.rest` always addresses the ACTIVE connection, so it is only valid for it.
+  if (target.isActive && !slot.restMissing) {
+    try {
+      return await rest(`/usage${force ? '?force=true' : ''}`, { timeoutMs: 45_000 })
+    } catch (error) {
+      if (!/\b404\b/.test(String(error?.message || error))) {
+        throw error
+      }
 
-  try {
-    const data = await rest(`/usage${force ? '?force=true' : ''}`, { timeoutMs: 45_000 })
-
-    restMissing = false
-
-    return data
-  } catch (error) {
-    if (!/\b404\b/.test(String(error?.message || error))) {
-      throw error
+      // The route exists only where the agent package is installed + mounted.
+      slot.restMissing = true
     }
-
-    restMissing = true
-
-    return fetchViaGateway()
   }
+
+  return fetchViaGateway(target)
 }
 
 // ── merge ──────────────────────────────────────────────────────────────────
 
-/** Both halves are optional; only a total blank is an error. */
-async function fetchLimits(force) {
-  const [pool, hermes] = await Promise.allSettled([fetchPool(force), fetchHermes(force)])
-  const poolValue = pool.status === 'fulfilled' ? pool.value : { ok: false, total: 0, accounts: [], error: String(pool.reason?.message || pool.reason) }
+const messageOf = error => String(error?.message || error)
 
-  if (hermes.status === 'rejected' && !poolValue.accounts.length) {
-    throw hermes.reason
+/** Both halves are optional and fail independently. */
+async function fetchLimits(target, slot, force) {
+  if (force) {
+    slot.restMissing = false
   }
 
-  const hermesValue = hermes.status === 'fulfilled' ? hermes.value : { provider: null, accounts: [] }
+  const [pool, hermes] = await Promise.allSettled([fetchPool(target, slot, force), fetchHermes(target, slot, force)])
 
-  return { ...hermesValue, pool: poolValue }
+  return {
+    pool: pool.status === 'fulfilled' ? pool.value : { ok: false, total: 0, accounts: [], error: messageOf(pool.reason) },
+    hermes: hermes.status === 'fulfilled' ? hermes.value : { provider: null, accounts: [], note: messageOf(hermes.reason) }
+  }
 }
 
 function refresh(force = false) {
-  if (!rest) {
+  const target = current
+
+  if (!rest || !target) {
     return Promise.resolve()
   }
 
-  if (inflight) {
-    return inflight
+  const slot = slotOf(target.key)
+
+  if (slot.inflight) {
+    return slot.inflight
   }
 
-  publish({ status: snapshot.data ? 'refreshing' : 'loading' })
-  inflight = fetchLimits(force)
-    .then(data => publish({ status: 'ready', data, error: null, at: Date.now() }))
+  publish(target.key, { status: slot.snapshot.data ? 'refreshing' : 'loading' })
+  slot.inflight = fetchLimits(target, slot, force)
+    .then(data => publish(target.key, { status: 'ready', data, error: null, at: Date.now() }))
     .catch(error => {
-      if (error?.message === NO_SESSION) {
-        return publish({ status: NO_SESSION, error: null, at: 0 })
-      }
-
-      const message = String(error?.message || error)
+      const message = messageOf(error)
 
       // Lands in ~/.hermes/logs/desktop.log — the only trace a chip failure
       // leaves. Once per distinct failure: the poll would otherwise repeat it.
-      if (snapshot.error !== message) {
+      if (slot.snapshot.error !== message) {
         console.error('[codex-limits] usage fetch failed:', message)
       }
 
-      return publish({ status: 'error', error: message, at: Date.now() })
+      publish(target.key, { status: 'error', error: message, at: Date.now() })
     })
     .finally(() => {
-      inflight = null
+      slot.inflight = null
     })
 
-  return inflight
+  return slot.inflight
 }
 
 function refreshIfStale() {
-  if (Date.now() - snapshot.at > STALE_MS) {
+  if (current && Date.now() - slotOf(current.key).snapshot.at > STALE_MS) {
     void refresh()
   }
 }
 
-function useLimits() {
-  const state = useSyncExternalStore(subscribe, () => snapshot)
+/** Follow the focused chat's server; switching servers shows that server's
+ *  cached data at once and re-reads it when stale. */
+function useTarget() {
+  const owner = useValue(host.state.focusedSessionOwner)
+  const activeConnectionId = useValue(host.state.connectionId)
+  const activeProfile = useValue(host.state.profile)
+  const focused = useValue(host.state.focusedSessionId)
+  const activeSession = useValue(host.state.activeSessionId)
+  const target = targetFrom(owner, activeConnectionId, activeProfile)
 
   useEffect(() => {
+    const changed = current?.key !== target.key || current?.isActive !== target.isActive
+
+    current = target
+
+    if (!labels.has(target.connectionId) && target.connectionId !== ACTIVE) {
+      void loadLabels()
+    }
+
+    if (changed) {
+      notify()
+      refreshIfStale()
+    }
+  }, [target.key, target.isActive])
+
+  useEffect(() => {
+    sessionId = focused ?? activeSession ?? null
+
+    // The own-account fallback needs a live chat; fetch as soon as one exists.
+    if (sessionId && current && slotOf(current.key).snapshot.data?.hermes?.note === NO_SESSION) {
+      void refresh()
+    }
+  }, [focused, activeSession])
+
+  return target
+}
+
+function usePolling() {
+  useEffect(() => {
     mounted += 1
-    refreshIfStale()
     pollTimer ??= setInterval(() => void refresh(), POLL_MS)
 
     return () => {
@@ -350,30 +499,6 @@ function useLimits() {
       }
     }
   }, [])
-
-  return state
-}
-
-/** The gateway fallback reads a session's route, so it needs a live session id:
- *  follow the focused chat and fetch as soon as there is one. */
-function useSessionBinding() {
-  const focused = useValue(host.state.focusedSessionId)
-  const active = useValue(host.state.activeSessionId)
-  const current = focused ?? active ?? null
-
-  useEffect(() => {
-    sessionId = current
-
-    if (!current || !restMissing) {
-      return
-    }
-
-    if (snapshot.status === NO_SESSION || !snapshot.data) {
-      void refresh()
-    } else {
-      refreshIfStale()
-    }
-  }, [current])
 }
 
 /** Quota moves when a turn ends — re-read shortly after the focused chat goes idle. */
@@ -493,6 +618,8 @@ const formatClock = ms => new Date(ms).toLocaleTimeString('ru-RU', { hour: '2-di
 
 const MUTED = { color: 'var(--ui-text-tertiary)', fontSize: '0.6875rem' }
 const SPREAD = { alignItems: 'baseline', display: 'flex', gap: 12, justifyContent: 'space-between' }
+const SECTION = { ...SPREAD, borderBottom: '1px solid var(--chrome-action-hover)', paddingBottom: 4 }
+const DANGER = 'var(--ui-red, #e5484d)'
 
 /** Depleting ring: the arc IS the remaining share. */
 function Ring({ remaining, size = 14 }) {
@@ -616,30 +743,48 @@ function PoolAccountRow({ account }) {
   })
 }
 
-function PoolSection({ pool, model, onUpdate, updating, updateError }) {
+function PoolSection({ pool, model, update }) {
+  if (pool.notInstalled) {
+    return jsxs('div', {
+      style: { display: 'grid', gap: 4 },
+      children: [
+        jsx('div', { children: 'На этом сервере плагин не установлен.' }),
+        jsx('div', {
+          style: MUTED,
+          children: `Capabilities → Plugins → Install from Git → ${REPO_URL}`
+        })
+      ]
+    })
+  }
+
   if (pool.missing) {
     return jsxs('div', {
       style: { display: 'grid', gap: 6 },
       children: [
-        jsx('div', {
-          style: MUTED,
-          children: 'Пул CLIProxyAPI: на сервере нет скрипта pool_usage.py — серверная часть плагина старая.'
-        }),
+        jsx('div', { style: MUTED, children: 'На этом сервере старая версия плагина — в ней нет чтения пула.' }),
         jsx(Button, {
           className: 'h-6 justify-self-start px-2 text-xs font-normal',
-          disabled: updating,
-          onClick: onUpdate,
+          disabled: update.busy,
+          onClick: update.run,
           type: 'button',
           variant: 'outline',
-          children: updating ? 'Обновляю…' : 'Обновить плагин на сервере (git pull)'
-        }),
-        updateError ? jsx('div', { style: { ...MUTED, color: 'var(--ui-red, #e5484d)' }, children: updateError }) : null
+          children: update.busy ? 'Обновляю…' : 'Обновить плагин на сервере'
+        })
       ]
     })
   }
 
   if (!pool.accounts.length) {
-    return pool.error ? jsx('div', { style: MUTED, children: `Пул CLIProxyAPI: ${pool.error}` }) : null
+    if (!pool.error) {
+      return null
+    }
+
+    return jsx('div', {
+      style: MUTED,
+      children: /auth directory not found/i.test(pool.error)
+        ? 'Пул CLIProxyAPI на этом сервере не найден.'
+        : `Пул CLIProxyAPI: ${pool.error}`
+    })
   }
 
   const family = familyOf(model)
@@ -659,7 +804,7 @@ function PoolSection({ pool, model, onUpdate, updating, updateError }) {
           style: { display: 'grid', gap: 10 },
           children: [
             jsxs('div', {
-              style: { ...SPREAD, borderBottom: '1px solid var(--chrome-action-hover)', paddingBottom: 4 },
+              style: SECTION,
               children: [
                 jsx('span', { style: { fontWeight: 600 }, children: `${KIND_LABELS[kind] ?? kind} · ${accounts.length}` }),
                 jsx('span', {
@@ -692,7 +837,7 @@ function AccountBlock({ account, showIdentity }) {
                 children: `#${account.index} ${account.label || account.id || 'аккаунт'}`
               }),
               jsx('span', {
-                style: { ...MUTED, color: exhausted ? 'var(--ui-red, #e5484d)' : MUTED.color },
+                style: { ...MUTED, color: exhausted ? DANGER : MUTED.color },
                 children: [account.plan, exhausted ? 'исчерпан' : null].filter(Boolean).join(' · ')
               })
             ]
@@ -709,68 +854,76 @@ function AccountBlock({ account, showIdentity }) {
   })
 }
 
-function LimitsPanel({ state, model }) {
-  const [updating, setUpdating] = useState(false)
-  const [updateError, setUpdateError] = useState(null)
-  const accounts = state.data?.accounts ?? []
-  const pool = state.data?.pool ?? { accounts: [] }
-  const hasPool = pool.accounts.length > 0
-  const pooled = accounts.length > 1
-  const working = state.status === 'loading' || state.status === 'refreshing'
-  const provider = state.data?.provider
-  const ownTitle = !provider || provider === 'openai-codex' ? 'Codex' : provider
-  const title = hasPool ? `Лимиты пула · ${pool.total ?? pool.accounts.length} акк.` : `Лимиты ${ownTitle}`
-  const nothing = !accounts.length && !hasPool
+function HermesSection({ hermes, hasPool }) {
+  const accounts = hermes?.accounts ?? []
 
-  const onUpdate = () => {
-    setUpdating(true)
-    setUpdateError(null)
-    updateBackendPackage()
-      .catch(error => setUpdateError(String(error?.message || error)))
-      .finally(() => setUpdating(false))
+  if (!accounts.length) {
+    // Normal on a server without its own provider account; only worth a line
+    // when there is nothing else to show.
+    if (hasPool || !hermes?.note) {
+      return null
+    }
+
+    return jsx('div', {
+      style: MUTED,
+      children: hermes.note === NO_SESSION ? 'Откройте любой чат этого сервера, чтобы подтянуть его лимиты.' : hermes.note
+    })
+  }
+
+  const provider = hermes.provider
+  const title = !provider || provider === 'openai-codex' ? 'Codex' : provider
+
+  return jsxs('div', {
+    style: { display: 'grid', gap: 10 },
+    children: [
+      jsx('div', { style: { ...SECTION, fontWeight: 600 }, children: `Свой аккаунт Hermes · ${title}` }),
+      ...accounts.map(account => jsx(AccountBlock, { account, showIdentity: accounts.length > 1 || hasPool }, account.id ?? account.index)),
+      hermes.source === 'gateway'
+        ? jsx('div', { style: { ...MUTED, color: 'var(--ui-text-quaternary)' }, children: 'Аккаунт, на котором работает этот чат.' })
+        : null
+    ]
+  })
+}
+
+function LimitsPanel({ state, model, server }) {
+  const [updating, setUpdating] = useState(false)
+  const [updateMessage, setUpdateMessage] = useState(null)
+  const pool = state.data?.pool ?? { accounts: [] }
+  const hermes = state.data?.hermes ?? null
+  const hasPool = pool.accounts.length > 0
+  const working = state.status === 'loading' || state.status === 'refreshing'
+  const nothingYet = !state.data && state.status !== 'error'
+
+  const update = {
+    busy: updating,
+    run: () => {
+      setUpdating(true)
+      setUpdateMessage(null)
+      updateServerPlugin()
+        .then(sha => setUpdateMessage({ ok: true, text: sha ? `Плагин на сервере обновлён (${sha}).` : 'Плагин на сервере обновлён.' }))
+        .catch(error => setUpdateMessage({ ok: false, text: messageOf(error) }))
+        .finally(() => setUpdating(false))
+    }
   }
 
   return jsxs('div', {
     style: { display: 'grid', fontSize: '0.75rem', gap: 12, maxHeight: '62vh', minWidth: 300, overflowY: 'auto', paddingRight: 2 },
     children: [
       jsxs('div', {
-        style: SPREAD,
+        style: { display: 'grid', gap: 2 },
         children: [
-          jsx('span', { style: { fontWeight: 600 }, children: title }),
-          !hasPool && !pooled && accounts[0]?.plan ? jsx('span', { style: MUTED, children: accounts[0].plan }) : null
+          jsx('span', { style: { fontWeight: 600 }, children: hasPool ? `Лимиты пула · ${pool.total ?? pool.accounts.length} акк.` : 'Лимиты' }),
+          jsx('span', { style: MUTED, children: `Сервер: ${server}` })
         ]
       }),
-      state.status === 'error' && nothing
-        ? jsx('div', { style: { color: 'var(--ui-red, #e5484d)' }, children: `Не удалось получить лимиты: ${state.error}` })
+      state.status === 'error'
+        ? jsx('div', { style: { color: DANGER }, children: `Не удалось получить лимиты: ${state.error}` })
         : null,
-      state.status === NO_SESSION && nothing
-        ? jsx('div', { style: { color: 'var(--ui-text-tertiary)' }, children: 'Откройте любой чат — лимиты берутся из его сессии.' })
-        : null,
-      nothing && (state.status === 'idle' || working)
-        ? jsx('div', { style: { color: 'var(--ui-text-tertiary)' }, children: 'Загружаю…' })
-        : null,
-      jsx(PoolSection, { model, onUpdate, pool, updateError, updating }),
-      accounts.length
-        ? jsxs('div', {
-            style: { display: 'grid', gap: 10 },
-            children: [
-              hasPool
-                ? jsx('div', {
-                    style: { ...SPREAD, borderBottom: '1px solid var(--chrome-action-hover)', fontWeight: 600, paddingBottom: 4 },
-                    children: `Hermes · свой аккаунт ${ownTitle}`
-                  })
-                : null,
-              ...accounts.map(account =>
-                jsx(AccountBlock, { account, showIdentity: pooled || hasPool }, account.id ?? account.index)
-              )
-            ]
-          })
-        : null,
-      state.data?.source === 'gateway' && !hasPool
-        ? jsx('div', {
-            style: { ...MUTED, color: 'var(--ui-text-quaternary)' },
-            children: 'Аккаунт, на котором работает этот чат (данные сервера).'
-          })
+      nothingYet ? jsx('div', { style: { color: 'var(--ui-text-tertiary)' }, children: 'Загружаю…' }) : null,
+      jsx(PoolSection, { model, pool, update }),
+      jsx(HermesSection, { hasPool, hermes }),
+      updateMessage
+        ? jsx('div', { style: { ...MUTED, color: updateMessage.ok ? MUTED.color : DANGER }, children: updateMessage.text })
         : null,
       jsxs('div', {
         style: {
@@ -779,18 +932,35 @@ function LimitsPanel({ state, model }) {
           color: 'var(--ui-text-quaternary)',
           display: 'flex',
           fontSize: '0.6875rem',
+          gap: 6,
           justifyContent: 'space-between',
           paddingTop: 8
         },
         children: [
           jsx('span', { children: state.at ? `обновлено в ${formatClock(state.at)}` : '' }),
-          jsxs(Button, {
-            className: 'h-6 gap-1 px-1.5 text-xs font-normal',
-            disabled: working,
-            onClick: () => void refresh(true),
-            type: 'button',
-            variant: 'ghost',
-            children: [jsx(icons.RefreshCw, { className: 'size-3' }), working ? 'Обновляю…' : 'Обновить']
+          jsxs('span', {
+            style: { display: 'flex', gap: 2 },
+            children: [
+              state.data && !pool.notInstalled
+                ? jsx(Button, {
+                    className: 'h-6 px-1.5 text-xs font-normal',
+                    disabled: updating || working,
+                    onClick: update.run,
+                    title: 'Скачать свежую версию плагина с GitHub на этот сервер',
+                    type: 'button',
+                    variant: 'ghost',
+                    children: updating ? 'Обновляю плагин…' : 'Обновить плагин'
+                  })
+                : null,
+              jsxs(Button, {
+                className: 'h-6 gap-1 px-1.5 text-xs font-normal',
+                disabled: working,
+                onClick: () => void refresh(true),
+                type: 'button',
+                variant: 'ghost',
+                children: [jsx(icons.RefreshCw, { className: 'size-3' }), working ? 'Обновляю…' : 'Обновить']
+              })
+            ]
           })
         ]
       })
@@ -799,38 +969,33 @@ function LimitsPanel({ state, model }) {
 }
 
 function LimitsChip() {
-  useSessionBinding()
-
-  const state = useLimits()
+  const target = useTarget()
+  const state = useSyncExternalStore(subscribe, readSnapshot)
   const model = useValue(host.state.model)
   const [open, setOpen] = useState(false)
 
+  usePolling()
   useRefreshAfterTurn()
 
-  const accounts = state.data?.accounts ?? []
+  const server = serverLabel(target.connectionId)
   const poolAccounts = state.data?.pool?.accounts ?? []
+  const ownAccounts = state.data?.hermes?.accounts ?? []
   const summary = poolAccounts.length ? poolSummary(poolAccounts, model) : null
-  const account = activeAccount(accounts)
+  const account = activeAccount(ownAccounts)
   const remaining = summary ? summary.remaining : tightest(account)
+  const loading = !state.data && (state.status === 'idle' || state.status === 'loading')
+  const label = remaining === null ? (loading ? '…' : '—') : `${remaining}%`
 
-  // Nothing to show for this setup (no credential anywhere) — stay out of the row.
-  if (state.status === 'ready' && !account && !poolAccounts.length) {
-    return null
-  }
-
-  const settled = state.status === 'error' || state.status === NO_SESSION
-  const label = remaining === null ? (settled || summary ? '—' : '…') : `${remaining}%`
-  const provider = state.data?.provider
-  const subject = !provider || provider === 'openai-codex' ? 'Codex' : provider
-
-  const problem =
-    state.status === 'error' ? state.error : state.status === NO_SESSION ? 'откройте чат, чтобы подтянуть данные' : null
-
-  const tip = summary
-    ? `Пул${summary.family ? ` ${KIND_LABELS[summary.family]}` : ''}: в среднем осталось ${summary.remaining ?? '—'}% · живых аккаунтов ${summary.alive} из ${summary.total}`
-    : remaining === null
-      ? `Лимиты ${subject}${problem ? `: ${problem}` : ''}`
-      : `Лимит ${subject}: осталось ${remaining}%${accounts.length > 1 ? ` · аккаунт #${account.index} из ${accounts.length}` : ''}`
+  const detail = summary
+    ? `пул${summary.family ? ` ${KIND_LABELS[summary.family]}` : ''}: в среднем осталось ${summary.remaining ?? '—'}% · живых аккаунтов ${summary.alive} из ${summary.total}`
+    : remaining !== null
+      ? `осталось ${remaining}%`
+      : state.data?.pool?.notInstalled
+        ? 'плагин на этом сервере не установлен'
+        : state.status === 'error'
+          ? state.error
+          : 'нет данных'
+  const tip = `Лимиты · ${server}: ${detail}`
 
   return jsxs(Popover, {
     onOpenChange: next => {
@@ -872,7 +1037,7 @@ function LimitsChip() {
         side: 'top',
         sideOffset: 8,
         style: { padding: 12, width: 'auto' },
-        children: jsx(LimitsPanel, { model, state })
+        children: jsx(LimitsPanel, { model, server, state })
       })
     ]
   })

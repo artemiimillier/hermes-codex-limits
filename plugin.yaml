@@ -1,4 +1,4 @@
 name: codex-limits
-version: 1.2.0
+version: 1.3.0
 description: "Remaining model quota next to the Hermes Desktop model picker: every account of a CLIProxyAPI pool (Codex + Claude) and the backend's own Codex accounts. Read-only."
 author: "Artemii Miller"

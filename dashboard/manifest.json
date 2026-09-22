@@ -3,7 +3,7 @@
   "label": "Codex Limits",
   "description": "Remaining quota of every account in a CLIProxyAPI pool and in the Hermes credential pool.",
   "icon": "Gauge",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "tab": { "path": "/codex-limits", "hidden": true },
   "entry": "dist/index.js",
   "api": "plugin_api.py"
