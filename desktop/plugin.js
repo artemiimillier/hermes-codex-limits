@@ -30,6 +30,7 @@ const STALE_MS = 60_000
 const POLL_MS = 5 * 60_000
 const AFTER_TURN_DELAY_MS = 4_000
 const ROUTES_TTL_MS = 60_000
+const WIDE_PANEL_FROM = 4
 const LOW_REMAINING = 25
 const CRITICAL_REMAINING = 10
 const REPO_URL = 'https://github.com/artemiimillier/hermes-codex-limits'
@@ -813,7 +814,16 @@ function PoolSection({ pool, model, update }) {
                 })
               ]
             }),
-            ...accounts.map(account => jsx(PoolAccountRow, { account }, account.id))
+            jsx('div', {
+              // One column in a narrow panel, two side by side once it is wide.
+              style: {
+                alignItems: 'start',
+                display: 'grid',
+                gap: '12px 20px',
+                gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))'
+              },
+              children: accounts.map(account => jsx(PoolAccountRow, { account }, account.id))
+            })
           ]
         },
         kind
@@ -906,8 +916,20 @@ function LimitsPanel({ state, model, server }) {
     }
   }
 
+  // A big pool gets a wide, two-column panel; the height follows the room the
+  // popover actually has above the composer (Radix publishes it), not a fixed vh.
+  const wide = pool.accounts.length > WIDE_PANEL_FROM
+
   return jsxs('div', {
-    style: { display: 'grid', fontSize: '0.75rem', gap: 12, maxHeight: '62vh', minWidth: 300, overflowY: 'auto', paddingRight: 2 },
+    style: {
+      display: 'grid',
+      fontSize: '0.75rem',
+      gap: 12,
+      maxHeight: 'calc(var(--radix-popover-content-available-height, 85vh) - 28px)',
+      overflowY: 'auto',
+      paddingRight: 4,
+      width: wide ? 'min(720px, calc(100vw - 48px))' : 'min(380px, calc(100vw - 48px))'
+    },
     children: [
       jsxs('div', {
         style: { display: 'grid', gap: 2 },
