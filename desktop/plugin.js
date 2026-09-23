@@ -281,10 +281,10 @@ async function updateServerPlugin() {
 // ── source 2: the server's own account(s) ──────────────────────────────────
 
 // `session.usage` renders the account block as text (the `/usage` lines):
-//   Provider: openai-codex (Prolite)
-//   Weekly: 5% remaining (95% used) • resets in 4d 22h (2026-09-26 12:57 UTC)
+//   Provider: openai-codex (Plus)
+//   Weekly: 60% remaining (40% used) • resets in 4d 22h (2030-01-01 12:00 UTC)
 //   Extra: unavailable • n/a
-//   Credits balance: $4.20
+//   Credits balance: $0.00
 const PROVIDER_LINE = /^Provider:\s*(\S+)(?:\s*\((.+)\))?\s*$/
 const WINDOW_LINE = /^(.+?):\s*\d+% remaining \((\d+)% used\)(?:\s*•\s*(.*))?$/
 const UNAVAILABLE_WINDOW_LINE = /^(.+?):\s*unavailable(?:\s*•\s*(.*))?$/

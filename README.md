@@ -1,9 +1,36 @@
-# Codex Limits — Hermes plugin
+# Codex Limits — остаток лимитов подписок в Hermes Desktop
 
-**[English](#english) · [Русский](#русский)**
+**[Русский](#русский) · [English](#english)**
 
-A chip right before the model picker in the Hermes Desktop composer that shows how much model
-quota is left. Click it for every account, every rate-limit window and when it resets.
+Кнопка рядом с выбором модели в Hermes Desktop: показывает, сколько лимита
+осталось на аккаунтах Claude и ChatGPT в вашем пуле. Нажмите — увидите каждый
+аккаунт, окна «5 часов» / «Неделя» и когда лимит сбросится.
+
+> **Сначала поставьте пул.** Плагин показывает аккаунты шлюза подписок
+> CLIProxyAPI. Если его ещё нет — поставьте по инструкции
+> [hermes-codex-pool](https://github.com/artemiimillier/hermes-codex-pool)
+> (шлюз подписки Claude/ChatGPT для Hermes), войдите хотя бы в один аккаунт,
+> потом возвращайтесь сюда.
+
+## Установка за 2 минуты (Русский, пошагово)
+
+1. Откройте **Hermes Desktop** и подключитесь к тому серверу, где стоит пул
+   (к тому же, где вы работаете с агентом).
+2. Слева откройте **Capabilities** (Возможности) → вкладка **Plugins**.
+3. Нажмите **Install from Git** и вставьте адрес:
+   `https://github.com/artemiimillier/hermes-codex-limits`
+4. Оставьте отмеченными обе галочки — **Agent plugin** и **Desktop UI** — и
+   нажмите **Install**.
+5. Рядом с выбором модели внизу окна чата появится кнопка с процентом. Нажмите
+   на неё — откроется список аккаунтов.
+
+Не появилась кнопка? В том же списке Plugins найдите **Codex Limits** и включите
+его в колонке **Desktop**. Пишет «Пул CLIProxyAPI на этом сервере не найден» —
+см. «Если что-то не так» ниже.
+
+Можно и одной фразой агенту: «Поставь плагин
+`hermes plugins install artemiimillier/hermes-codex-limits --enable`», но
+интерфейсную часть всё равно проще поставить кнопкой Install from Git.
 
 ---
 
@@ -34,14 +61,18 @@ Nothing is hard-wired to any particular server, and nothing is ever sent to the 
 - GitHub is contacted only when you install the plugin or press **"Обновить плагин"** (update).
 
 The only fixed values are the plugin folder name (`plugins/codex-limits`), the usual Hermes home
-locations (`$HERMES_HOME`, `~/.hermes`, `/opt/data`) and those two provider URLs.
+locations (`$HERMES_HOME`, `~/.hermes`, and `/opt/data` — the official Docker image's home) and
+those two provider URLs. The plugin does not need the gateway's address or port at all: it reads
+the pool's account folder directly, so a pool on any port works.
 
 ### Requirements
 
 - Hermes Desktop + a Hermes backend (local or remote). Tested with client/backend v0.21.3.
 - `python3` on the backend host (standard library only).
 - For the pool view: CLIProxyAPI running **on the same machine / container as the Hermes backend**.
-  The pool itself does not need to be in any repository — the plugin finds the running proxy.
+  Don't have one yet? Set it up first with
+  [hermes-codex-pool](https://github.com/artemiimillier/hermes-codex-pool); the plugin finds its
+  account folder (`$HERMES_HOME/cliproxy/auths`) and any other running CLIProxyAPI by itself.
 
 ### Install
 
@@ -149,7 +180,9 @@ The interface is in Russian.
 - Hermes Desktop и сервер Hermes (локальный или удалённый). Проверено на v0.21.3.
 - `python3` на сервере.
 - Для пула: CLIProxyAPI должен работать **на той же машине / в том же контейнере, что и Hermes**.
-  Отдельный репозиторий для пула не нужен — плагин сам находит запущенный прокси.
+  Ещё нет пула — поставьте его по [hermes-codex-pool](https://github.com/artemiimillier/hermes-codex-pool).
+  Плагин сам находит папку аккаунтов (`$HERMES_HOME/cliproxy/auths` или папку запущенного
+  прокси). Адрес и порт шлюза плагину не нужны.
 
 ### Установка
 
@@ -189,8 +222,11 @@ hermes plugins install artemiimillier/hermes-codex-limits --enable
 ### Если что-то не так
 
 - `На этом сервере плагин не установлен` — переключитесь на этот сервер и сделайте Install from Git.
-- `Пул CLIProxyAPI на этом сервере не найден` — впишите путь к папке с аккаунтами прокси одной строкой в
-  `<домашняя папка hermes>/plugins/codex-limits/auth-dir.txt` на сервере.
+- `Пул CLIProxyAPI на этом сервере не найден` — скажите агенту: «впиши путь к папке аккаунтов
+  пула одной строкой в `<домашняя папка hermes>/plugins/codex-limits/auth-dir.txt`» (для пула
+  из hermes-codex-pool это `$HERMES_HOME/cliproxy/auths`).
+- `no codex/claude auth files in the pool directory` — пул найден, но в нём ещё нет ни одного
+  аккаунта: войдите в аккаунт по инструкции пула.
 - `token expired (proxy will refresh it)` — нормально, прокси обновит токен сам.
 
 ## License

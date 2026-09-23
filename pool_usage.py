@@ -144,11 +144,16 @@ def find_auth_dir(explicit: Optional[str] = None) -> Optional[Path]:
         if path and path.is_dir():
             return path
     home = Path(os.path.expanduser("~"))
-    hermes_home = Path(os.environ.get("HERMES_HOME") or "/opt/data")
-    for path in (home / ".cli-proxy-api", hermes_home / ".cli-proxy-api"):
+    # $HERMES_HOME, else the default ~/.hermes; /opt/data is the official Docker image's home.
+    hermes_homes = list(dict.fromkeys(Path(p) for p in (os.environ.get("HERMES_HOME"), home / ".hermes", "/opt/data") if p))
+    candidates = [home / ".cli-proxy-api"]
+    for hermes_home in hermes_homes:
+        # ``cliproxy/auths`` is the layout of github.com/artemiimillier/hermes-codex-pool
+        candidates += [hermes_home / "cliproxy" / "auths", hermes_home / ".cli-proxy-api"]
+    for path in candidates:
         if _looks_like_auth_dir(path):
             return path
-    return _search_auth_dir([hermes_home, home])
+    return _search_auth_dir([h for h in hermes_homes if h.is_dir()] + [home])
 
 
 # ── reading accounts ─────────────────────────────────────────────────
